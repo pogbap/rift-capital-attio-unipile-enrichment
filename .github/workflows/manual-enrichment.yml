@@ -23,7 +23,6 @@ jobs:
         env:
           ATTIO_API_KEY: ${{ secrets.API_KEY_ATTIO }}
           UNIPILE_API_KEY: ${{ secrets.UNIPILE_API_CODE }}
-          UNIPILE_BASE_URL: ${{ secrets.UNIPILE_BASE_URL }}
           UNIPILE_ACCOUNT_IDS: ${{ secrets.JF_LINKEDIN_ACCOUNT_ID }},${{ secrets.JR_LINKEDIN_ACCOUNT_ID }}
         run: python enrichment.py
       - name: Upload run log
