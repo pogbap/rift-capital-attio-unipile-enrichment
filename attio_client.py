@@ -20,11 +20,18 @@ def _headers():
 def query_target_people(limit=50, offset=0):
     """
     People whose personae_type (multiselect) contains at least one of the
-    target option titles. See DESIGN.md §1 for why $in replaces the source
-    scenario's 7 OR'd $eq conditions.
+    target option titles.
+
+    NOTE: Attio's REST filtering does not support $in on select-type
+    attributes (confirmed against the live API -- a $in filter here returns
+    400 Bad Request even though $in works for text/record-reference
+    attributes). Use an $or of per-title $eq conditions instead -- this is
+    the same shape as the original Make scenario's 7 OR'd $eq conditions
+    that DESIGN.md §1 describes replacing, restored here because $in turned
+    out not to be viable for this attribute type.
     """
     body = {
-        "filter": {"personae_type": {"$in": TARGET_PERSONAE_TYPES}},
+        "filter": {"$or": [{"personae_type": {"$eq": title}} for title in TARGET_PERSONAE_TYPES]},
         "limit": limit,
         "offset": offset,
     }
