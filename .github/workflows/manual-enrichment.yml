@@ -1,0 +1,67 @@
+name: Manual Enrichment Run
+
+on:
+  workflow_dispatch:
+      inputs:
+            batch_size:
+                    description: 'Batch size for this run'
+                            required: true
+                                    default: '1'
+
+                                    jobs:
+                                      run-enrichment:
+                                          runs-on: ubuntu-latest
+                                              steps:
+                                                    - uses: actions/checkout@v4
+                                                          - uses: actions/setup-python@v5
+                                                                  with:
+                                                                            python-version: '3.11'
+                                                                                  - run: pip install -r requirements.txt
+                                                                                        - name: Override batch size for this run
+                                                                                                run: sed -i "s/^BATCH_SIZE_PER_RUN = .*/BATCH_SIZE_PER_RUN = ${{ github.event.inputs.batch_size }}/" config.py
+                                                                                                      - name: Run enrichment
+                                                                                                              env:
+                                                                                                                        ATTIO_API_KEY: ${{ secrets.ATTIO_API_KEY }}
+                                                                                                                                  UNIPILE_API_KEY: ${{ secrets.UNIPILE_API_KEY }}
+                                                                                                                                            UNIPILE_ACCOUNT_IDS: ${{ secrets.UNIPILE_ACCOUNT_IDS }}
+                                                                                                                                                    run: python enrichment.py
+                                                                                                                                                          - name: Upload run log
+                                                                                                                                                                  if: always()
+                                                                                                                                                                          uses: actions/upload-artifact@v4
+                                                                                                                                                                                  with:
+                                                                                                                                                                                            name: runs-log
+                                                                                                                                                                                                      path: runs.log.jsonl
+name: Manual Enrichment Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'Batch size for this run'
+        required: true
+        default: '1'
+
+jobs:
+  run-enrichment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Override batch size for this run
+        run: sed -i "s/^BATCH_SIZE_PER_RUN = .*/BATCH_SIZE_PER_RUN = ${{ github.event.inputs.batch_size }}/" config.py
+      - name: Run enrichment
+        env:
+          ATTIO_API_KEY: ${{ secrets.ATTIO_API_KEY }}
+          UNIPILE_API_KEY: ${{ secrets.UNIPILE_API_KEY }}
+          UNIPILE_ACCOUNT_IDS: ${{ secrets.UNIPILE_ACCOUNT_IDS }}
+        run: python enrichment.py
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runs-log
+          path: runs.log.jsonl
+                                                                                                                                                                                                    
