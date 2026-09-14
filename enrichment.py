@@ -57,8 +57,42 @@ def process_branch_a(person, run_stats):
         write_location_if_allowed(person, loc["city"], loc["country"], run_stats)
 
 
+def _write_location_from_candidate(person, candidate, run_stats):
+    """Best-effort location extraction + write from a Unipile search
+    candidate (or a matched profile). Prefers location fields already on the
+    candidate; falls back to a full profile fetch (own pacing sleep applied
+    inside the client) when the search result doesn't carry them. Never
+    touches the linkedin field — that stays gated by the identity-confidence
+    policy in process_branch_b."""
+    if not candidate:
+        return
+    loc = unipile_client.extract_location(candidate)
+    if not loc:
+        linkedin_url = candidate.get("public_profile_url") or candidate.get("profile_url")
+        handle = extract_handle(linkedin_url or "")
+        if handle:
+            profile = unipile_client.get_profile(handle)
+            loc = unipile_client.extract_location(profile)
+    if loc:
+        write_location_if_allowed(person, loc["city"], loc["country"], run_stats)
+
+
 def process_branch_b(person, run_stats):
-    """No linkedin URL on file — search, and only commit a confident match."""
+    """No linkedin URL on file — search Unipile.
+
+    LinkedIn identity writes stay strict: only a confident single match ever
+    gets written to the `linkedin` field, everything else is flagged via an
+    Attio Note for a human to confirm — never guessed.
+
+    Location is handled separately and more permissively (explicit product
+    decision, 2026-09-14: locations matter more than 100%-clean LinkedIn
+    matches for this workspace). Even when the identity match is too
+    ambiguous to write, we still take a best-effort location from the top
+    search candidate and write it if the person's primary_location is empty.
+    Worst case on a wrong candidate is an imprecise location on an
+    already-flagged record (visible in the same review note) — never a wrong
+    LinkedIn URL, which stays fully gated.
+    """
     candidates = unipile_client.search_people(
         name=person["name"], company=None, title=person["job_title"]
     )
@@ -72,27 +106,24 @@ def process_branch_b(person, run_stats):
 
     if len(strong_matches) == 1:
         match = strong_matches[0]
+        reason = None
     elif len(candidates) == 1 and _name_matches(candidates[0], person["name"]):
         # single result, name matches, but no corroborating signal available
         # (e.g. company/title unknown) -- still ambiguous per policy, flag it
         match = None
-        attio_client.flag_needs_linkedin_review(
-            person["id"],
-            reason="Single candidate but no corroborating company/title signal",
-            candidates=candidates,
-        )
-        run_stats["flagged_for_review"] += 1
-        return
+        reason = "Single candidate but no corroborating company/title signal"
     else:
         match = None
+        reason = "Multiple plausible candidates or weak/partial match" if candidates else "No candidates found"
 
     if match is None:
-        attio_client.flag_needs_linkedin_review(
-            person["id"],
-            reason="Multiple plausible candidates or weak/partial match" if candidates else "No candidates found",
-            candidates=candidates,
-        )
+        attio_client.flag_needs_linkedin_review(person["id"], reason=reason, candidates=candidates)
         run_stats["flagged_for_review"] += 1
+        # Still take a best-effort location from the top candidate -- see
+        # docstring above for why this is treated as lower-risk than the
+        # LinkedIn URL itself.
+        if candidates:
+            _write_location_from_candidate(person, candidates[0], run_stats)
         return
 
     linkedin_url = match.get("public_profile_url") or match.get("profile_url")
@@ -103,16 +134,7 @@ def process_branch_b(person, run_stats):
     attio_client.update_person(person["id"], {"linkedin": linkedin_url})
     run_stats["linkedin_written"] += 1
 
-    # Prefer location already present on the search result; otherwise a
-    # fresh profile fetch (own pacing sleep applied inside the client).
-    loc = unipile_client.extract_location(match)
-    if not loc:
-        handle = extract_handle(linkedin_url)
-        if handle:
-            profile = unipile_client.get_profile(handle)
-            loc = unipile_client.extract_location(profile)
-    if loc:
-        write_location_if_allowed(person, loc["city"], loc["country"], run_stats)
+    _write_location_from_candidate(person, match, run_stats)
 
 
 def _name_matches(candidate: dict, name: str) -> bool:

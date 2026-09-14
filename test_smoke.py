@@ -78,7 +78,11 @@ assert stats["records_processed"] == 4
 assert any(rid == "p1" for rid, _ in written["updates"]), "Branch A should have written p1's location"
 assert any(rid == "p2" and "linkedin" in attrs for rid, attrs in written["updates"]), "Branch B strong match should write linkedin for p2"
 assert any(rid == "p3" for rid, _ in written["notes"]), "Ambiguous Branch B (p3) should be flagged for review"
-assert not any(rid == "p3" for rid, _ in written["updates"]), "Ambiguous Branch B (p3) must NOT get any Attio write"
+assert not any(rid == "p3" and "linkedin" in attrs for rid, attrs in written["updates"]), "Ambiguous Branch B (p3) must NOT get a LinkedIn write, confident match or not"
+assert any(rid == "p3" and "primary_location" in attrs for rid, attrs in written["updates"]), (
+    "Ambiguous Branch B (p3) should still get a best-effort location write from the top candidate "
+    "(2026-09-14 policy: locations matter more than 100%-clean LinkedIn matches here)"
+)
 assert not any(rid == "p4" for rid, _ in written["updates"]), "p4 already has a location -- fill-if-empty must skip it"
 
 print("\nSMOKE TEST PASSED")
