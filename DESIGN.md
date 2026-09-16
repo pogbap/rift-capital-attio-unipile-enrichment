@@ -64,17 +64,78 @@ the attribute is currently null/empty. (User confirmed this over the "always ove
   change is required for this — a Note is enough to surface it to the team; can be upgraded to a
   dedicated status/tag attribute later if the team wants it filterable as a view.
 
+This stays strict for identity: the `linkedin` field is never written on a guess, no matter how the
+corroborating signal was produced (free-text or structured, see below). Only the **location** policy
+was relaxed on 2026-09-14 — see the note at the end of this section.
+
+**Company corroboration (2026-09-16 — closes a gap left open at first build).** The original
+`_company_corroborates()` was stubbed to always return `False` ("left permissive... until wired to a
+real company-name lookup, so it never silently over-claims a match on company alone" — see the
+original commit). That meant a strong match could in practice only come from title corroboration,
+a strict substring check against the LinkedIn headline — brittle, and the main driver of the
+`flagged_for_review` volume observed in early runs (run #22: 8 of 20 records flagged, mostly for
+"no corroborating company/title signal"). Two layers now feed corroboration, cheapest first:
+
+1. **Free-text company-name match** — `_company_corroborates()` now actually checks whether the
+   person's known employer (pulled from their linked Attio company record) appears in the
+   candidate's LinkedIn headline, the same technique already used for title. No new external calls:
+   the company name comes from a single existing Attio hop, and the check just wasn't wired up in
+   the initial build.
+2. **Structured company-id disambiguation (Jules Ferrer / Sales Navigator only)** — when neither
+   company-name-in-headline nor title corroboration produces a single strong match, `enrichment.py`
+   makes one more attempt before flagging: `_disambiguate_via_sales_nav()` re-runs the people search
+   on **Jules Ferrer's account specifically** (the one Sales-Navigator-enabled seat among the three
+   connected LinkedIn accounts), filtered by the person's employer as LinkedIn's own *structured*
+   "current company" field (`company: [<linkedin_company_id>]`) rather than free-text. The company id
+   is resolved two ways, cheapest/most-precise first:
+   - if the Attio company record already has a `linkedin` URL on file, extract the page slug and
+     resolve it directly via `GET /linkedin/company/<slug>` — exact by construction, no ambiguity;
+   - otherwise, fall back to a LinkedIn company-name search (`search_company_id()`), only trusting a
+     single exact (case-insensitive) name match.
+
+   A single confident name match against that company-filtered candidate list is trusted as a strong
+   match — it's LinkedIn's own structured data confirming the employer, not a guess — and gets
+   written exactly like an ordinary strong match. Live-tested against real flagged records before
+   shipping: resolved a real ambiguous case (Mark Chan / Happiness Capital: free-text search returned
+   Mark Chan plus lookalikes with no corroborating headline text; the company-filtered search on
+   Jules Ferrer's account narrowed it to exactly one confident match). Also confirmed this **doesn't
+   always resolve** a case — some people's LinkedIn "Experience" section isn't tagged to their
+   employer's official Company Page, so the structured filter can legitimately come back empty; when
+   that happens the record still falls through to the normal flagging path, with a note added to the
+   review reason so a human knows a company-verified check was already tried and came up empty.
+
+   This is best-effort and additive only: no `UNIPILE_SALES_NAV_ACCOUNT_ID` configured, an
+   unresolvable company, or any lookup error along the way all just fall back to flagging as before
+   — none of it is allowed to raise into `run_stats["errors"]` (see §5/the unipile_client fix of
+   2026-09-16 for why a single optional-enhancement failure must never fail the whole run). It also
+   costs up to 2 extra Unipile calls (company lookup + company-filtered people search), spent only on
+   the subset of records that would otherwise be flagged, and only against Jules Ferrer's account
+   rather than the round-robin — worth watching in `runs.log.jsonl` (`company_verified_matches`) if
+   that account's daily volume becomes a concern (see §6's per-account envelope).
+
+**Location policy (2026-09-14, unchanged by the above).** Location is handled separately and more
+permissively than identity: locations matter more than 100%-clean LinkedIn matches for this
+workspace, so even a flagged/ambiguous record still gets a best-effort location written from the top
+search candidate when the person's `primary_location` is empty. Worst case on a wrong candidate is an
+imprecise location on an already-flagged record (visible in the same review note) — never a wrong
+LinkedIn URL, which stays fully gated by everything above.
+
 ## 5. Pacing (non-negotiable, every Unipile call)
 
-Every LinkedIn-facing Unipile call (profile fetch, people search, email fetch) is preceded by a
-`random.uniform(8, 13)` second sleep — a floor, not a target. Unipile's own "Provider Limits and
-Restrictions" guidance (`developer.unipile.com/docs/provider-limits-and-restrictions`) says: space
-calls out with random delays, don't chain them at fixed intervals, start conservative on
+Every LinkedIn-facing Unipile call (profile fetch, people search, company lookup/search, email
+fetch) is preceded by a `random.uniform(8, 13)` second sleep — a floor, not a target. Unipile's own
+"Provider Limits and Restrictions" guidance (`developer.unipile.com/docs/provider-limits-and-restrictions`)
+says: space calls out with random delays, don't chain them at fixed intervals, start conservative on
 newer/lower-volume accounts, and prefer webhooks to polling where possible.
 
 Their documented safe envelope for a standard (non-Sales-Navigator) LinkedIn account:
 - ~100 profile views/day (recommended, not hard-enforced)
 - most other discrete actions (searches, etc.) bucketed at ~100/day/account
+
+A profile/page fetch or search that comes back 404 (not found) or 422 `errors/invalid_recipient`
+(locked/restricted/unreachable) is treated as a normal "nothing here" outcome, not an automation
+error — see `unipile_client._is_unreachable_profile()` (added 2026-09-16 after run #20 failed the
+whole batch over exactly one such profile).
 
 ## 6. Batch size & cadence — re-derived, not copied from source
 
@@ -91,6 +152,12 @@ Recommended: **3 records per run, every 30 minutes, weekdays 09:00–18:00 Europ
 follow-up profile fetch). Spread across 3 accounts round-robin, worst case ≈ 45 calls/account/day —
 comfortably under the ~100/day/account envelope even before accounting for the review-flag path,
 which stops after the search call and never reaches a second Unipile call.
+
+Jules Ferrer's account carries extra load beyond its round-robin share: it's also the only account
+used for the §4 Sales Navigator disambiguation, up to 2 extra calls per record that would otherwise
+be flagged (roughly 40% of Branch B in early runs). Still comfortably inside the envelope at current
+batch sizes, but re-check this account's daily total specifically if batch size or cadence is ever
+increased.
 
 This is a starting point, intentionally conservative — tighten or loosen after watching the run log
 for a couple of weeks. Rather than guessing further, treat cadence as tunable in `config.py`.
@@ -125,6 +192,9 @@ of the flow (email fetch + Attio write) works today without it.
   Vincent Lerat). Script expects `UNIPILE_API_KEY` and `UNIPILE_ACCOUNT_IDS` (comma-separated,
   round-robin) as environment variables — actual values still need to be pulled from the Unipile
   dashboard and set wherever this script runs (not hardcoded in code or in a scheduled-task prompt).
+  `UNIPILE_SALES_NAV_ACCOUNT_ID` (§4) is a separate, optional env var — set it to Jules Ferrer's
+  account_id specifically (already one of the values in `UNIPILE_ACCOUNT_IDS`) to enable the
+  disambiguation step; leave unset to disable it, no other behavior changes.
 - **Attio**: this session already has a live Attio connection (used for all the schema lookups
   above) — the scheduled/on-demand runs can either reuse that MCP connection (if run as a Claude
   scheduled task) or use a raw `ATTIO_API_KEY` (script supports both call styles, see `attio_client.py`).
@@ -137,3 +207,6 @@ of the flow (email fetch + Attio write) works today without it.
 - Decide script hosting: a Claude scheduled task can run this by shelling out to the script if the
   workspace persists between firings; otherwise run it from wherever Rift Capital already hosts
   small automations (a cron box, a serverless function) and point *that* at Attio + Unipile.
+- Watch `company_verified_matches` vs `flagged_for_review` in `runs.log.jsonl` for a couple of weeks
+  to see how much the §4 Sales Navigator disambiguation is actually cutting the review queue, and
+  whether Jules Ferrer's account needs its own, smaller batch-size allowance as a result.

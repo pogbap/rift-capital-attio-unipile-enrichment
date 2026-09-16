@@ -4,7 +4,7 @@ Unipile. Run this on a schedule (see DESIGN.md §6 for recommended cadence:
 3 records / run, every 30 min, weekdays 09:00-18:00 Europe/Paris) rather
 than looping continuously — one process invocation == one run == one batch.
 
-    python enrichment.py
+python enrichment.py
 
 Never pushes anything to Lemlist — that's a separate, manually-triggered
 script (lemlist_handoff.py), by design (see DESIGN.md §8).
@@ -19,6 +19,7 @@ import run_logger
 import unipile_client
 
 LINKEDIN_HANDLE_RE = re.compile(r"/in/([^/?#]+)")
+COMPANY_SLUG_RE = re.compile(r"/company/([^/?#]+)")
 
 
 def extract_handle(linkedin_url: str) -> str | None:
@@ -92,7 +93,32 @@ def process_branch_b(person, run_stats):
     Worst case on a wrong candidate is an imprecise location on an
     already-flagged record (visible in the same review note) — never a wrong
     LinkedIn URL, which stays fully gated.
+
+    Addition (2026-09-16): when the free-text search alone can't produce a
+    strong match, this now makes one more attempt before flagging --
+    _disambiguate_via_sales_nav() re-runs the search on Jules Ferrer's
+    Sales-Navigator-enabled Unipile account, filtered by the person's known
+    employer as LinkedIn's own *structured* "current company" field
+    (resolved from the company's LinkedIn page already on file in Attio, or
+    a company-name search as fallback) instead of guessing from headline
+    text. A single confident name match against that narrowed list is
+    trusted as a strong match, same as a normal strong match above -- it's
+    LinkedIn's own structured data corroborating the identity, not our
+    guess. This is best-effort only: no Sales Nav account configured, an
+    unresolvable company, or any lookup error all just fall back to
+    flagging as before, and never raise into run_stats['errors'] (an
+    optional enhancement failing should never fail the whole run over it --
+    see the 2026-09-16 unipile_client fix for exactly this failure mode).
     """
+    company_info = None
+    if person.get("company_record_id"):
+        try:
+            company_info = attio_client.get_company_info(person["company_record_id"])
+        except Exception:
+            company_info = None  # best-effort only -- falls back to title-only corroboration
+
+    company_name = (company_info or {}).get("name")
+
     candidates = unipile_client.search_people(
         name=person["name"], company=None, title=person["job_title"]
     )
@@ -100,7 +126,7 @@ def process_branch_b(person, run_stats):
     strong_matches = [
         c for c in candidates
         if _name_matches(c, person["name"]) and (
-            _company_corroborates(c, person) or _title_corroborates(c, person)
+            _company_corroborates(c, company_name) or _title_corroborates(c, person)
         )
     ]
 
@@ -115,6 +141,9 @@ def process_branch_b(person, run_stats):
     else:
         match = None
         reason = "Multiple plausible candidates or weak/partial match" if candidates else "No candidates found"
+
+    if match is None and company_info:
+        match, reason = _disambiguate_via_sales_nav(person, company_info, reason, run_stats)
 
     if match is None:
         attio_client.flag_needs_linkedin_review(person["id"], reason=reason, candidates=candidates)
@@ -137,6 +166,46 @@ def process_branch_b(person, run_stats):
     _write_location_from_candidate(person, match, run_stats)
 
 
+def _disambiguate_via_sales_nav(person, company_info, reason, run_stats):
+    """Last resort before flagging -- see process_branch_b docstring.
+    Returns (match_or_None, updated_reason). Never raises: any failure here
+    is folded into the flag reason instead, so an optional enhancement can
+    never turn into a whole-run failure."""
+    account_id = config.UNIPILE_SALES_NAV_ACCOUNT_ID
+    if not account_id:
+        return None, reason
+    try:
+        company_id = _resolve_company_linkedin_id(company_info, account_id)
+        if not company_id:
+            return None, f"{reason} (employer '{company_info.get('name')}' not confidently resolved on LinkedIn)"
+        narrowed = unipile_client.search_people(name=person["name"], account_id=account_id, company_id=company_id)
+        strong = [c for c in narrowed if _name_matches(c, person["name"])]
+        if len(strong) == 1:
+            run_stats["company_verified_matches"] += 1
+            return strong[0], None
+        return None, (
+            f"{reason}; company-filtered search at {company_info.get('name')} found "
+            f"{len(strong)} confident match(es) among {len(narrowed)} employee result(s)"
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort disambiguation only
+        return None, f"{reason} (company-verified lookup failed: {exc})"
+
+
+def _resolve_company_linkedin_id(company_info, account_id):
+    """Prefer the company's own LinkedIn page (exact, no ambiguity) over a
+    free-text name search (fallback for when Attio has no linkedin field
+    on the company record)."""
+    linkedin_url = company_info.get("linkedin_url")
+    if linkedin_url:
+        m = COMPANY_SLUG_RE.search(linkedin_url)
+        if m:
+            company_id = unipile_client.get_company_id_by_slug(m.group(1), account_id=account_id)
+            if company_id:
+                return company_id
+    name = company_info.get("name")
+    return unipile_client.search_company_id(name, account_id=account_id) if name else None
+
+
 def _name_matches(candidate: dict, name: str) -> bool:
     if not name:
         return False
@@ -144,12 +213,15 @@ def _name_matches(candidate: dict, name: str) -> bool:
     return cand_name == name.strip().lower()
 
 
-def _company_corroborates(candidate: dict, person: dict) -> bool:
-    # Best-effort: requires the search response to include a current company
-    # name/id to compare against person["company_record_id"]. Left permissive
-    # (returns False) until wired to a real company-name lookup, so it never
-    # silently over-claims a match on company alone.
-    return False
+def _company_corroborates(candidate: dict, company_name: str | None) -> bool:
+    """Free-text check: does the person's known employer name show up in
+    the candidate's LinkedIn headline? A miss here isn't fatal -- process_
+    branch_b falls through to the stronger structured company-id lookup
+    (_disambiguate_via_sales_nav) before giving up and flagging. Never
+    fuzzy -- a real substring match only, so it never over-claims."""
+    if not company_name:
+        return False
+    return company_name.strip().lower() in (candidate.get("headline") or "").strip().lower()
 
 
 def _title_corroborates(candidate: dict, person: dict) -> bool:
@@ -164,6 +236,7 @@ def run_batch():
         "linkedin_written": 0,
         "locations_written": 0,
         "flagged_for_review": 0,
+        "company_verified_matches": 0,
         "skipped_location_not_empty": 0,
         "errors": [],
     }

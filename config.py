@@ -51,6 +51,15 @@ UNIPILE_ACCOUNT_IDS = [
 ]
 # e.g. UNIPILE_ACCOUNT_IDS=jules_resny_account_id,jules_ferrer_account_id,vincent_lerat_account_id
 
+# Jules Ferrer's account specifically -- the one Sales Navigator seat among
+# the three above. Not part of the round-robin: used only as a targeted,
+# best-effort disambiguation step in Branch B (see DESIGN.md §4) when the
+# ordinary free-text search can't produce a confident match, to try a
+# structured "current company" filter instead of guessing from headline
+# text. Leave unset to disable the feature entirely (falls back to flagging
+# for review as before, exactly like before this was added).
+UNIPILE_SALES_NAV_ACCOUNT_ID = os.environ.get("UNIPILE_SALES_NAV_ACCOUNT_ID", "")
+
 # --- Pacing (non-negotiable floor, see DESIGN.md §5) ---------------------
 UNIPILE_SLEEP_MIN_SECONDS = 8
 UNIPILE_SLEEP_MAX_SECONDS = 13

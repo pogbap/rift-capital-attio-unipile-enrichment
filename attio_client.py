@@ -81,6 +81,31 @@ def get_person_by_id(record_id: str):
     return get_record_values(resp.json()["data"])
 
 
+def get_company_info(record_id: str):
+    """Fetch a company's name and LinkedIn company-page URL (when known).
+    Used by Branch B (see DESIGN.md §4) to corroborate a LinkedIn match
+    against the person's actual employer -- first as a cheap free-text
+    check against the candidate's headline, then, if that's inconclusive,
+    to resolve the company's own LinkedIn id for a structured
+    disambiguation search on Jules Ferrer's Sales Navigator account."""
+    resp = requests.get(
+        f"{ATTIO_BASE_URL}/objects/companies/records/{record_id}",
+        headers=_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    values = resp.json()["data"].get("values", {})
+
+    def first(attr):
+        v = values.get(attr) or []
+        return v[0] if v else None
+
+    return {
+        "name": (first("name") or {}).get("value"),
+        "linkedin_url": (first("linkedin") or {}).get("value"),
+    }
+
+
 def update_person(record_id, attrs: dict):
     """PATCH a subset of attribute values onto a person record."""
     payload = {"data": {"values": {k: [v] if not isinstance(v, list) else v for k, v in attrs.items()}}}
