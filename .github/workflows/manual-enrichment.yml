@@ -9,6 +9,7 @@ on:
         default: '1'
   schedule:
     - cron: '0 7 * * *'
+
 jobs:
   run-enrichment:
     runs-on: ubuntu-latest
@@ -26,6 +27,7 @@ jobs:
           UNIPILE_API_KEY: ${{ secrets.UNIPILE_API_CODE }}
           UNIPILE_BASE_URL: ${{ secrets.UNIPILE_BASE_URL }}
           UNIPILE_ACCOUNT_IDS: ${{ secrets.JF_LINKEDIN_ACCOUNT_ID }},${{ secrets.JR_LINKEDIN_ACCOUNT_ID }},${{ secrets.VL_LINKEDIN_ACCOUNT_ID }}
+          UNIPILE_SALES_NAV_ACCOUNT_ID: ${{ secrets.JF_LINKEDIN_ACCOUNT_ID }}
         run: python enrichment.py
       - name: Upload run log
         if: always()
