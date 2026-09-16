@@ -46,9 +46,27 @@ def _headers():
     return {"X-API-KEY": UNIPILE_API_KEY, "Content-Type": "application/json"}
 
 
+def _is_unreachable_profile(resp):
+    """True for statuses that mean 'this profile can't be fetched' rather
+    than a bug in our request: 404 (not found) and 422 with Unipile's
+    errors/invalid_recipient (profile locked/restricted/unreachable). Both
+    are expected, non-actionable outcomes for a subset of real LinkedIn
+    profiles and should be skipped, not raised as automation errors."""
+    if resp.status_code == 404:
+        return True
+    if resp.status_code == 422:
+        try:
+            return resp.json().get("type") == "errors/invalid_recipient"
+        except ValueError:
+            return True
+    return False
+
+
 def get_profile(handle_or_id: str, account_id: str | None = None):
     """Fetch a LinkedIn profile by public identifier (the /in/<handle> slug)
-    or Unipile provider id. Returns None on 404 (profile not found/blocked)."""
+    or Unipile provider id. Returns None on 404 (profile not found/blocked)
+    or 422 invalid_recipient (profile locked/unreachable) rather than
+    raising."""
     account_id = account_id or next_account_id()
     _sleep_before_call()
     resp = requests.get(
@@ -57,7 +75,7 @@ def get_profile(handle_or_id: str, account_id: str | None = None):
         params={"account_id": account_id},
         timeout=30,
     )
-    if resp.status_code == 404:
+    if _is_unreachable_profile(resp):
         return None
     resp.raise_for_status()
     return resp.json()
@@ -85,7 +103,8 @@ def search_people(name: str, company: str | None = None, title: str | None = Non
 def get_email(handle_or_id: str, account_id: str | None = None):
     """Attempt to resolve an email address for a LinkedIn profile. Returns
     None if Unipile can't find one (common — not every profile exposes an
-    email even with a connection)."""
+    email even with a connection) or if the profile is unreachable (404 or
+    422 invalid_recipient)."""
     account_id = account_id or next_account_id()
     _sleep_before_call()
     resp = requests.get(
@@ -94,7 +113,7 @@ def get_email(handle_or_id: str, account_id: str | None = None):
         params={"account_id": account_id},
         timeout=30,
     )
-    if resp.status_code == 404:
+    if _is_unreachable_profile(resp):
         return None
     resp.raise_for_status()
     return resp.json().get("email")
