@@ -71,6 +71,29 @@ upper-bound validation on the `batch_size` workflow input today, so a typo or an
 manual run can silently burn the entire job timeout for zero result. Worth adding an explicit cap in
 `manual-enrichment.yml` if this recurs.
 
+**Scan ceiling addendum (2026-09-17, later same day).** The two fixes above created a new failure mode
+of their own: `query_target_people()` paginates from `offset=0` every run (nothing persisted between
+runs) and stopped scanning once `scanned >= max_scan`, which defaulted to 500 and was never overridden
+from `enrichment.py`. As more of the *front* of Attio's fixed unsorted order got fully enriched or
+Branch-B-flagged over successive runs, the first 500 records eventually became 100% done/flagged —
+and since every run re-scans that same first-500 window from scratch, the job started returning
+`{'records_processed': 0, ...}` on every run, even though a live check confirmed thousands of
+untouched records exist further down (a spot-check at offset 500 found 18/50 still missing `linkedin`
+and 4/50 still missing `primary_location`). The 500-record scan window had simply never reached them.
+
+Fixed by adding `MAX_SCAN_PER_RUN` to `config.py` (default 8000, comfortably above the ~6k target
+population) and threading it through as `query_target_people(limit=..., max_scan=config.MAX_SCAN_PER_RUN)`
+in `enrichment.py` — previously `max_scan` silently used the function's own default and was never wired
+to anything. Raising the scan ceiling is cheap: Attio list/notes calls carry no artificial pacing (only
+Unipile calls do, via §5's 8-13s floor), so scanning the whole population every run costs some extra
+Attio API round trips, not extra wall-clock hours. The real per-run time budget stays governed by
+`BATCH_SIZE_PER_RUN` (how many *matching* records actually get processed with Unipile calls), not by
+how far the scan has to walk to find them. This is a stopgap, not a permanent fix — a workspace that
+keeps growing past `MAX_SCAN_PER_RUN` before this job manages to enrich its backlog down would hit the
+exact same wall again at a higher record count; the durable fix would be server-side filtering (once
+Attio's `$not_empty` supports the `location` type) or persisting scan offset/state between runs instead
+of always restarting at 0.
+
 ## 2. `primary_location` — structured value shape
 
 `primary_location` is `type: location` (confirmed in schema, `is_writable: true`). Per Attio's

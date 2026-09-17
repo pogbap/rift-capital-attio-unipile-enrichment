@@ -241,7 +241,9 @@ def run_batch():
         "errors": [],
     }
 
-    records = attio_client.query_target_people(limit=config.BATCH_SIZE_PER_RUN)
+    records = attio_client.query_target_people(
+        limit=config.BATCH_SIZE_PER_RUN, max_scan=config.MAX_SCAN_PER_RUN
+    )
     for raw in records:
         person = attio_client.get_record_values(raw)
         run_stats["records_processed"] += 1

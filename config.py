@@ -66,6 +66,18 @@ UNIPILE_SLEEP_MAX_SECONDS = 13
 
 # --- Batching & cadence (see DESIGN.md §6; tune after watching runs.log) -
 BATCH_SIZE_PER_RUN = 3
+
+# How many raw Attio records query_target_people() will look at per run before
+# giving up short of BATCH_SIZE_PER_RUN collected (see DESIGN.md §1, "Scan
+# ceiling" addendum, 2026-09-17). Must comfortably exceed the target
+# population size (~6k as of writing) -- every run starts scanning from
+# offset 0 again (no state persisted between runs), so once the first
+# max_scan records in Attio's fixed unsorted order are all done/flagged,
+# a too-small cap here makes the job permanently return zero forever, no
+# matter how many untouched records sit further down. Scanning itself has
+# no artificial pacing (that's only on Unipile calls), so a high cap here
+# is cheap -- the real time cost stays bounded by BATCH_SIZE_PER_RUN.
+MAX_SCAN_PER_RUN = 8000
 RUN_INTERVAL_MINUTES = 30
 WORK_DAYS = {0, 1, 2, 3, 4}  # Mon-Fri
 WORK_HOURS_LOCAL = (9, 18)  # Europe/Paris
