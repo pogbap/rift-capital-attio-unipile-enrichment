@@ -49,14 +49,27 @@ record_reference/text attributes, not the composite `location` type `primary_loc
 `attio_client.py` for the implementation and its own test (`test_pagination.py`, not part of the
 original `test_smoke.py`).
 
-Known follow-on gap this doesn't solve: a record that can *never* resolve (no LinkedIn presence at
-all, or missing company data — see the two examples in run #25, 2026-09-16) keeps `linkedin` empty
-forever, so it keeps matching "still needs work" and keeps resurfacing indefinitely, re-running the
-same doomed search and creating a fresh duplicate "Needs LinkedIn Review" Note each time rather than
-being resolved once and left alone. Worth a follow-up if duplicate Notes on the same person become
-noisy in practice — likely needs a real "already flagged, awaiting human" signal (a status attribute
-or checking for an existing Note before creating another), which is a bigger schema change than this
-fix and wasn't part of what was asked here.
+**"Already flagged" addendum (2026-09-17, same day).** The gap above wasn't hypothetical: the very
+next run after shipping the fix above surfaced it immediately — "Yorkseed ™" and Stan Chanavat (the
+two unresolvable examples from run #25) got a second, duplicate "Needs LinkedIn Review" Note within
+hours, because they still have no `linkedin` value and so still matched "still needs work." Fixed by
+adding a second condition to `query_target_people()`'s per-record skip: for any record that would go
+to Branch B (no `linkedin` on file), also skip it if `has_needs_linkedin_review_note()` finds an
+existing "Needs LinkedIn Review" Note already on the record. This does *not* apply to Branch A
+records (have `linkedin`, still missing `primary_location`) — a stale Note from before someone got
+their LinkedIn URL added by hand must never block their location refresh; see `_would_go_to_branch_b()`
+and its test in `test_note_guard.py`. A human resolving the situation (adding the `linkedin` URL, or
+deleting the Note to ask for a fresh look) is what clears this now — not another automated pass.
+Doesn't need a new attribute/schema change; the existing Note *is* the "already flagged" signal, we
+just weren't checking for it before creating another one.
+
+Batch-size caution (2026-09-17): a manually-triggered run with `batch_size: 3000` hit GitHub Actions'
+6-hour job timeout and got force-cancelled with nothing processed or logged (`run_logger.log_run()`
+only writes once, at the end of the whole batch). Not a bug in the job itself — at the mandatory
+8–13s-per-call pacing (§5), that batch size was never going to finish in 6 hours — but there's no
+upper-bound validation on the `batch_size` workflow input today, so a typo or an overly ambitious
+manual run can silently burn the entire job timeout for zero result. Worth adding an explicit cap in
+`manual-enrichment.yml` if this recurs.
 
 ## 2. `primary_location` — structured value shape
 

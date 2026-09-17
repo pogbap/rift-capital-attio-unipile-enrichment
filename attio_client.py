@@ -17,20 +17,55 @@ def _headers():
     }
 
 
+def _first_value(values: dict, attr: str):
+    entries = values.get(attr) or []
+    return (entries[0] or {}).get("value") if entries else None
+
+
 def _still_needs_enrichment(record) -> bool:
     """True unless this record already has both `linkedin` and
     `primary_location` filled in -- i.e. there's nothing left for this job
     to do for them. See query_target_people() for why this check happens
     in Python rather than as part of the server-side filter."""
     values = record.get("values", {})
-
-    def first_value(attr):
-        entries = values.get(attr) or []
-        return (entries[0] or {}).get("value") if entries else None
-
-    has_linkedin = bool(first_value("linkedin"))
+    has_linkedin = bool(_first_value(values, "linkedin"))
     has_location = bool(values.get("primary_location"))  # location entries carry no "value" key
     return not (has_linkedin and has_location)
+
+
+def _would_go_to_branch_b(record) -> bool:
+    """Mirrors enrichment.py's own branch test (has_value(linkedin_url)) --
+    only Branch B (no linkedin on file) ever creates a "Needs LinkedIn
+    Review" Note, so only these records need the has_needs_linkedin_
+    review_note() check in query_target_people()."""
+    values = record.get("values", {})
+    return not bool(_first_value(values, "linkedin"))
+
+
+def has_needs_linkedin_review_note(record_id: str) -> bool:
+    """True if this person already has an unresolved "Needs LinkedIn
+    Review" Note on file (see flag_needs_linkedin_review()).
+
+    Added 2026-09-17: once query_target_people() started converging on
+    "still needs work" records instead of re-sampling the live population,
+    a record that can never resolve (no LinkedIn presence at all, missing
+    company data, etc.) kept qualifying as "still needs work" forever --
+    within a day of shipping that fix, the same two unresolvable records
+    from an earlier run got a second, duplicate review Note. This is the
+    guard against that: query_target_people() skips a no-linkedin record
+    that already has one of these Notes, so it stops resurfacing and
+    re-flagging on every run. A human resolving the situation (adding the
+    linkedin URL by hand, or deleting the Note to ask for a fresh look)
+    is what clears this -- not another automated pass."""
+    resp = requests.get(
+        f"{ATTIO_BASE_URL}/notes",
+        headers=_headers(),
+        params={"parent_object": ATTIO_PEOPLE_OBJECT, "parent_record_id": record_id, "limit": 50},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    notes = resp.json().get("data", [])
+    return any(n.get("title") == "Needs LinkedIn Review" for n in notes)
 
 
 def _fetch_people_page(page_size, offset):
@@ -52,8 +87,13 @@ def _fetch_people_page(page_size, offset):
 def query_target_people(limit=50, max_scan=500, page_size=50):
     """
     People whose personae_type (multiselect) contains at least one of the
-    target option titles, AND who still need this job's work -- i.e. don't
-    already have both `linkedin` and `primary_location` filled in.
+    target option titles, AND who still need this job's work:
+    - don't already have both `linkedin` and `primary_location` filled in
+      (see _still_needs_enrichment()), and
+    - for anyone still missing `linkedin` (Branch B territory), don't
+      already have an unresolved "Needs LinkedIn Review" Note on file
+      (see has_needs_linkedin_review_note()) -- otherwise an unresolvable
+      record just keeps resurfacing and re-flagging forever.
 
     NOTE: Attio's REST filtering does not support $in on select-type
     attributes (confirmed against the live API -- a $in filter here returns
@@ -63,27 +103,34 @@ def query_target_people(limit=50, max_scan=500, page_size=50):
     that DESIGN.md §1 describes replacing, restored here because $in turned
     out not to be viable for this attribute type.
 
-    The "still needs work" half can't be folded into that same server-side
-    filter: Attio's $not_empty operator is only documented for domain,
-    (personal) name, phone number, interaction, record_reference and text
-    attributes -- not the composite `location` type that `primary_location`
-    is. So instead of one filtered query, this paginates through the
-    personae_type-matching population (in whatever order Attio returns --
-    "a deterministic random order" per Attio's own docs when no sort is
-    given) and skips already-fully-enriched records in Python, stopping
-    once `limit` still-needing records are collected.
+    Neither "still needs work" condition above can be folded into that same
+    server-side filter: Attio's $not_empty operator is only documented for
+    domain, (personal) name, phone number, interaction, record_reference
+    and text attributes -- not the composite `location` type that
+    `primary_location` is -- and "has no Note with this title" isn't a
+    filterable attribute at all. So instead of one filtered query, this
+    paginates through the personae_type-matching population (in whatever
+    order Attio returns -- "a deterministic random order" per Attio's own
+    docs when no sort is given) and skips already-handled records in
+    Python, stopping once `limit` still-needing records are collected.
 
-    Without this, every run queried with offset 0 and no state tracked
-    between runs, so it wasn't paginating through the target population at
-    all -- it re-sampled whatever "first N" a live, constantly-changing
-    workspace happened to return each time, with no guarantee of ever
-    reaching everyone and no way to avoid re-pulling already-done records
-    (see DESIGN.md §1, 2026-09-17 addendum, for the full diagnosis).
+    Without the first check, every run queried with offset 0 and no state
+    tracked between runs, so it wasn't paginating through the target
+    population at all -- it re-sampled whatever "first N" a live,
+    constantly-changing workspace happened to return each time, with no
+    guarantee of ever reaching everyone and no way to avoid re-pulling
+    already-done records (see DESIGN.md §1, 2026-09-17 addendum, for the
+    full diagnosis). Without the second check (added same day, once the
+    first one went live and immediately surfaced this), a record that can
+    never resolve keeps qualifying as "still needs work" forever, so it
+    keeps getting re-searched and re-flagged with a fresh duplicate Note
+    every run instead of being left alone once a human's already been
+    asked to look at it.
 
     `max_scan` is a safety cap on how many records this will look at
     before giving up short of `limit` records collected (only matters if
-    the personae_type population is mostly already fully enriched); not
-    expected to bind in normal operation.
+    the personae_type population is mostly already fully enriched or
+    already flagged); not expected to bind in normal operation.
     """
     collected = []
     offset = 0
@@ -94,10 +141,13 @@ def query_target_people(limit=50, max_scan=500, page_size=50):
             break
         for raw in page:
             scanned += 1
-            if _still_needs_enrichment(raw):
-                collected.append(raw)
-                if len(collected) >= limit:
-                    break
+            if not _still_needs_enrichment(raw):
+                continue
+            if _would_go_to_branch_b(raw) and has_needs_linkedin_review_note(raw["id"]["record_id"]):
+                continue
+            collected.append(raw)
+            if len(collected) >= limit:
+                break
         offset += page_size
     return collected
 
