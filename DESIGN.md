@@ -30,6 +30,34 @@ Filtering by option **title** (not option ID) works directly against `/v2/object
 Option IDs are recorded in `config.py` as a fallback in case a workspace migration ever requires
 filtering by ID instead of label.
 
+**"Still needs work" addendum (2026-09-17).** The query above matches the *target population*, not
+"who still needs enrichment" — early runs always called it with `offset=0` and nothing tracked
+between runs, so every run just asked Attio for "the first N people matching personae_type" again.
+Attio's own docs say an unsorted query returns "a deterministic random order," so this wasn't
+pagination at all: it re-sampled whatever "first N" a live, constantly-changing workspace (real
+email/calendar sync keeps adding new matching people) happened to return each time. Two concrete
+symptoms: a person who's already fully enriched (`linkedin` and `primary_location` both set) could
+still get pulled into a batch and waste a Unipile call for nothing, and there was no guarantee every
+targeted person ever actually got visited.
+
+Fixed in `attio_client.query_target_people()` by additionally filtering out, in Python, any record
+that already has both `linkedin` and `primary_location` filled in — paginating through the
+personae_type-matching population (25/50-record pages) until enough still-needing records are
+collected to fill the batch, rather than trusting a single unpaginated call. This couldn't be pushed
+into Attio's own filter: `$not_empty` is only documented for domain/name/phone/interaction/
+record_reference/text attributes, not the composite `location` type `primary_location` is. See
+`attio_client.py` for the implementation and its own test (`test_pagination.py`, not part of the
+original `test_smoke.py`).
+
+Known follow-on gap this doesn't solve: a record that can *never* resolve (no LinkedIn presence at
+all, or missing company data — see the two examples in run #25, 2026-09-16) keeps `linkedin` empty
+forever, so it keeps matching "still needs work" and keeps resurfacing indefinitely, re-running the
+same doomed search and creating a fresh duplicate "Needs LinkedIn Review" Note each time rather than
+being resolved once and left alone. Worth a follow-up if duplicate Notes on the same person become
+noisy in practice — likely needs a real "already flagged, awaiting human" signal (a status attribute
+or checking for an existing Note before creating another), which is a bigger schema change than this
+fix and wasn't part of what was asked here.
+
 ## 2. `primary_location` — structured value shape
 
 `primary_location` is `type: location` (confirmed in schema, `is_writable: true`). Per Attio's

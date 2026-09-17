@@ -17,22 +17,26 @@ def _headers():
     }
 
 
-def query_target_people(limit=50, offset=0):
-    """
-    People whose personae_type (multiselect) contains at least one of the
-    target option titles.
+def _still_needs_enrichment(record) -> bool:
+    """True unless this record already has both `linkedin` and
+    `primary_location` filled in -- i.e. there's nothing left for this job
+    to do for them. See query_target_people() for why this check happens
+    in Python rather than as part of the server-side filter."""
+    values = record.get("values", {})
 
-    NOTE: Attio's REST filtering does not support $in on select-type
-    attributes (confirmed against the live API -- a $in filter here returns
-    400 Bad Request even though $in works for text/record-reference
-    attributes). Use an $or of per-title $eq conditions instead -- this is
-    the same shape as the original Make scenario's 7 OR'd $eq conditions
-    that DESIGN.md §1 describes replacing, restored here because $in turned
-    out not to be viable for this attribute type.
-    """
+    def first_value(attr):
+        entries = values.get(attr) or []
+        return (entries[0] or {}).get("value") if entries else None
+
+    has_linkedin = bool(first_value("linkedin"))
+    has_location = bool(values.get("primary_location"))  # location entries carry no "value" key
+    return not (has_linkedin and has_location)
+
+
+def _fetch_people_page(page_size, offset):
     body = {
         "filter": {"$or": [{"personae_type": {"$eq": title}} for title in TARGET_PERSONAE_TYPES]},
-        "limit": limit,
+        "limit": page_size,
         "offset": offset,
     }
     resp = requests.post(
@@ -43,6 +47,59 @@ def query_target_people(limit=50, offset=0):
     )
     resp.raise_for_status()
     return resp.json().get("data", [])
+
+
+def query_target_people(limit=50, max_scan=500, page_size=50):
+    """
+    People whose personae_type (multiselect) contains at least one of the
+    target option titles, AND who still need this job's work -- i.e. don't
+    already have both `linkedin` and `primary_location` filled in.
+
+    NOTE: Attio's REST filtering does not support $in on select-type
+    attributes (confirmed against the live API -- a $in filter here returns
+    400 Bad Request even though $in works for text/record-reference
+    attributes). Use an $or of per-title $eq conditions instead -- this is
+    the same shape as the original Make scenario's 7 OR'd $eq conditions
+    that DESIGN.md §1 describes replacing, restored here because $in turned
+    out not to be viable for this attribute type.
+
+    The "still needs work" half can't be folded into that same server-side
+    filter: Attio's $not_empty operator is only documented for domain,
+    (personal) name, phone number, interaction, record_reference and text
+    attributes -- not the composite `location` type that `primary_location`
+    is. So instead of one filtered query, this paginates through the
+    personae_type-matching population (in whatever order Attio returns --
+    "a deterministic random order" per Attio's own docs when no sort is
+    given) and skips already-fully-enriched records in Python, stopping
+    once `limit` still-needing records are collected.
+
+    Without this, every run queried with offset 0 and no state tracked
+    between runs, so it wasn't paginating through the target population at
+    all -- it re-sampled whatever "first N" a live, constantly-changing
+    workspace happened to return each time, with no guarantee of ever
+    reaching everyone and no way to avoid re-pulling already-done records
+    (see DESIGN.md §1, 2026-09-17 addendum, for the full diagnosis).
+
+    `max_scan` is a safety cap on how many records this will look at
+    before giving up short of `limit` records collected (only matters if
+    the personae_type population is mostly already fully enriched); not
+    expected to bind in normal operation.
+    """
+    collected = []
+    offset = 0
+    scanned = 0
+    while len(collected) < limit and scanned < max_scan:
+        page = _fetch_people_page(page_size, offset)
+        if not page:
+            break
+        for raw in page:
+            scanned += 1
+            if _still_needs_enrichment(raw):
+                collected.append(raw)
+                if len(collected) >= limit:
+                    break
+        offset += page_size
+    return collected
 
 
 def get_record_values(record):
